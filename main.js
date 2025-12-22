@@ -6,23 +6,32 @@ document.addEventListener('click', async () => {
 	}
 }, { once: true });
 
-// --- AUDIO ENGINE ---
+// --- AUDIO ENGINE PROFISSIONAL ---
 let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 let audioBuffer = null;
-let sourceNode = null;
+let sourceNode = null;	   // O som que está tocando
+let nextSourceNode = null;   // O som agendado (para troca perfeita)
 let gainNode = audioCtx.createGain();
 gainNode.connect(audioCtx.destination);
 
-let isPlaying = false, startTime = 0, pausedAt = 0, loopEnabled = false;
-let playlist = [], currentSong = null, sections = [], currentSectionIndex = -1, nextSectionIndex = -1, animId;
-let fadeTimeout = null; // Para controlar o tempo do fade
+// --- ESTADO ---
+let isPlaying = false;
+let startTime = 0;	   // Momento zero do audioContext
+let pausedAt = 0;		// Onde parou (segundos)
+let loopEnabled = false;
+
+let playlist = [], currentSong = null, sections = [];
+let currentSectionIndex = -1, nextSectionIndex = -1;
+let animId;
+let isScheduled = false; // Trava de segurança para agendamento
 
 const offcanvas = new bootstrap.Offcanvas('#menu');
 
 // --- CARREGAMENTO ---
 document.getElementById('folder-input').addEventListener('change', async (e) => {
 	const files = Array.from(e.target.files);
-	const audioFiles = files.filter(f => f.name.toLowerCase().match(/\.(mp3|wav|ogg)$/));
+	// Aceita mp3, wav, ogg e m4a
+	const audioFiles = files.filter(f => f.name.toLowerCase().match(/\.(mp3|wav|ogg|m4a)$/));
 	const jsonFiles = files.filter(f => f.name.toLowerCase().endsWith('.json'));
 	playlist = [];
 
@@ -32,8 +41,12 @@ document.getElementById('folder-input').addEventListener('change', async (e) => 
 		if (match) {
 			try {
 				const data = JSON.parse(await match.text());
-				playlist.push({ name: data.title || baseName, audioFile: audio, sections: data.sections.sort((a, b) => a.time - b.time) });
-			} catch (e) { }
+				playlist.push({ 
+					name: data.title || baseName, 
+					audioFile: audio, 
+					sections: data.sections.sort((a, b) => a.time - b.time) 
+				});
+			} catch (e) { console.error("Erro JSON:", e); }
 		}
 	}
 	renderPlaylist();
@@ -42,7 +55,7 @@ document.getElementById('folder-input').addEventListener('change', async (e) => 
 
 function renderPlaylist() {
 	const list = document.getElementById('song-list');
-	if (playlist.length === 0) { list.innerHTML = '<div class="p-4 text-center text-muted">Nada encontrado.</div>'; return; }
+	if (playlist.length === 0) { list.innerHTML = '<div class="p-4 text-center text-muted">Nenhum par (Audio + JSON) encontrado.</div>'; return; }
 	document.getElementById('empty-state').classList.add('d-none');
 
 	list.innerHTML = playlist.map((s, i) => `
@@ -56,24 +69,41 @@ async function loadSong(i) {
 	stopAudio();
 	currentSong = playlist[i];
 	sections = currentSong.sections;
+	
+	// Feedback visual imediato
 	document.getElementById('song-title').innerText = currentSong.name;
 	document.getElementById('loader').classList.remove('d-none');
 	document.getElementById('btn-play').disabled = true;
 	document.getElementById('ready').classList.add('d-none');
-
+	
 	document.querySelectorAll('.song-item').forEach(el => el.classList.remove('active-song'));
 	document.querySelectorAll('.song-item')[i].classList.add('active-song');
 
 	try {
 		const buffer = await currentSong.audioFile.arrayBuffer();
+		// AQUI ESTAVA O ERRO GENÉRICO. Agora tratamos melhor.
 		audioBuffer = await audioCtx.decodeAudioData(buffer);
+		
 		document.getElementById('loader').classList.add('d-none');
 		document.getElementById('ready').classList.remove('d-none');
 		document.getElementById('btn-play').disabled = false;
+		
 		renderGrid();
-		jumpToSection(0, false);
+		
+		// Prepara para tocar do início (sem dar play)
+		currentSectionIndex = 0;
+		pausedAt = sections[0].time;
+		updateTimerVisual(pausedAt);
+		updateButtonStyles();
+		
 		offcanvas.hide();
-	} catch (e) { alert("Erro no áudio."); }
+
+	} catch (e) { 
+		// ALERTA DE ERRO MELHORADO
+		document.getElementById('loader').classList.add('d-none');
+		alert("ERRO CRÍTICO: Não foi possível ler o áudio.\n\nMotivo: " + e.message + "\n\nVerifique se o arquivo está corrompido.");
+		console.error(e);
+	}
 }
 
 function renderGrid() {
@@ -82,110 +112,191 @@ function renderGrid() {
 	`).join('');
 }
 
-// --- PLAYBACK ---
-function playAudio(offset) {
-	if (sourceNode) sourceNode.disconnect();
+// --- ENGINE DE PLAYBACK (ZERO ATRASO) ---
 
-	// IMPORTANTE: Reseta o volume para 100% antes de tocar
-	gainNode.gain.cancelScheduledValues(audioCtx.currentTime);
-	gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
-	document.getElementById('btn-fade').classList.remove('fade-active');
+function playAudio(offset, when = 0) {
+	// Se 'when' for 0, toca AGORA. Se for maior que 0, agenda para o futuro.
+	const startTimeAbs = (when === 0) ? audioCtx.currentTime : when;
 
-	sourceNode = audioCtx.createBufferSource();
-	sourceNode.buffer = audioBuffer;
-	sourceNode.connect(gainNode);
-	sourceNode.start(0, offset);
-	startTime = audioCtx.currentTime - offset;
-	isPlaying = true;
-	updateUI(true);
-	startLogic();
+	const source = audioCtx.createBufferSource();
+	source.buffer = audioBuffer;
+	source.connect(gainNode);
+	source.start(startTimeAbs, offset);
+	
+	if (when === 0) {
+		// Play Imediato
+		if (sourceNode) try { sourceNode.stop(); } catch(e){}
+		sourceNode = source;
+		startTime = audioCtx.currentTime - offset;
+		isPlaying = true;
+		isScheduled = false;
+		updateUI(true);
+		startLogic();
+	} else {
+		// Agendamento Futuro (Crossfade/Seamless)
+		nextSourceNode = source;
+	}
 }
 
 function stopAudio() {
-	// Cancela qualquer Fade pendente
-	if (fadeTimeout) clearTimeout(fadeTimeout);
+	// Para tudo (atual e agendado)
+	if (sourceNode) { try{ sourceNode.stop(); } catch(e){} sourceNode = null; }
+	if (nextSourceNode) { try{ nextSourceNode.stop(); } catch(e){} nextSourceNode = null; }
+	
+	// Cancela Fades
 	gainNode.gain.cancelScheduledValues(audioCtx.currentTime);
 	gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
 	document.getElementById('btn-fade').classList.remove('fade-active');
 
-	if (sourceNode) { sourceNode.stop(); sourceNode = null; }
-	isPlaying = false; pausedAt = 0; currentSectionIndex = -1; nextSectionIndex = -1;
-	updateUI(false); updateButtonStyles();
+	isPlaying = false;
+	pausedAt = 0; 
+	nextSectionIndex = -1;
+	isScheduled = false;
+	
+	updateUI(false);
+	updateButtonStyles();
 	cancelAnimationFrame(animId);
 	document.getElementById('timer').innerText = "00:00";
 }
 
 function triggerFadeOut() {
 	if (!isPlaying) return;
-
 	const fadeBtn = document.getElementById('btn-fade');
-	fadeBtn.classList.add('fade-active'); // Feedback visual
-
-	const fadeDuration = 5; // 3 Segundos
+	fadeBtn.classList.add('fade-active');
+	
 	const now = audioCtx.currentTime;
-
-	// Curva de volume suave
+	// Garante que o volume começa de onde está
 	gainNode.gain.setValueAtTime(gainNode.gain.value, now);
-	gainNode.gain.linearRampToValueAtTime(0, now + fadeDuration);
+	// Desce para 0 em 3 segundos
+	gainNode.gain.linearRampToValueAtTime(0, now + 3);
 
-	// Agenda o Stop real para daqui a 3 segundos
-	fadeTimeout = setTimeout(() => {
-		stopAudio();
-	}, fadeDuration * 1000);
+	setTimeout(() => stopAudio(), 3000);
 }
 
 function togglePlay() {
 	if (isPlaying) {
 		pausedAt = audioCtx.currentTime - startTime;
-		if (sourceNode) { sourceNode.stop(); sourceNode = null; }
-		isPlaying = false;
-		updateUI(false);
-		cancelAnimationFrame(animId);
+		stopAudio();
 	} else {
 		if (audioCtx.state === 'suspended') audioCtx.resume();
-		playAudio(pausedAt);
+		// Se a música parou, retoma. Se for nova, começa do inicio da sessão
+		let startPoint = pausedAt > 0 ? pausedAt : (sections[0] ? sections[0].time : 0);
+		playAudio(startPoint);
+		updateButtonStyles();
 	}
 }
 
+// --- LÓGICA INTELIGENTE (LOOKAHEAD) ---
 function startLogic() {
 	cancelAnimationFrame(animId);
+
 	const check = () => {
 		if (!isPlaying) return;
-		const now = audioCtx.currentTime - startTime;
-		const m = Math.floor(now / 60), s = Math.floor(now % 60);
-		document.getElementById('timer').innerText = `${m < 10 ? '0' + m : m}:${s < 10 ? '0' + s : s}`;
 
+		const now = audioCtx.currentTime - startTime;
+		updateTimerVisual(now);
+
+		// Verifica a próxima sessão
 		if (currentSectionIndex !== -1 && sections[currentSectionIndex + 1]) {
-			if (now >= sections[currentSectionIndex + 1].time) {
-				if (loopEnabled) playAudio(sections[currentSectionIndex].time);
-				else if (nextSectionIndex !== -1) {
-					const t = nextSectionIndex; nextSectionIndex = -1; jumpToSection(t, true);
+			const nextSec = sections[currentSectionIndex + 1];
+			const timeRemaining = nextSec.time - now;
+
+			// [MÁGICA DO ZERO DELAY]
+			// Faltando 0.2s para acabar, nós já agendamos a troca na placa de som
+			if (timeRemaining < 0.2 && timeRemaining > 0 && !isScheduled) {
+				isScheduled = true; // Trava para não agendar 2 vezes
+				
+				const switchTimeAbs = audioCtx.currentTime + timeRemaining; // O momento exato no futuro
+
+				if (loopEnabled) {
+					// LOOP: Volta pro início da ATUAL
+					const loopStart = sections[currentSectionIndex].time;
+					performSeamlessSwitch(switchTimeAbs, loopStart, currentSectionIndex);
+				
+				} else if (nextSectionIndex !== -1) {
+					// PRÓXIMA MARCADA: Vai para a escolhida
+					const targetStart = sections[nextSectionIndex].time;
+					const targetIdx = nextSectionIndex;
+					nextSectionIndex = -1;
+					performSeamlessSwitch(switchTimeAbs, targetStart, targetIdx);
+				
 				} else {
-					currentSectionIndex++; updateButtonStyles();
+					// NATURAL: Segue o baile (não precisa fazer nada no áudio, só visual)
 				}
 			}
-		} else if (now >= audioBuffer.duration) stopAudio();
+			
+			// Atualização Visual (passou da linha)
+			if (now >= nextSec.time + 0.05) {
+				 if (!loopEnabled && nextSectionIndex === -1 && isScheduled === false) {
+					 currentSectionIndex++;
+					 updateButtonStyles();
+				 }
+				 // Destrava o agendamento se já passou tempo suficiente
+				 if(now >= nextSec.time + 0.5) isScheduled = false; 
+			}
+
+		} else if (now >= audioBuffer.duration) {
+			// Fim da música
+			stopAudio();
+		}
+
 		animId = requestAnimationFrame(check);
 	};
 	check();
 }
 
+// Função Auxiliar para Troca Perfeita
+function performSeamlessSwitch(whenAbs, offset, newIdx) {
+	// 1. Toca o novo som no tempo exato futuro
+	playAudio(offset, whenAbs);
+	
+	// 2. Para o som antigo nesse mesmo tempo
+	if(sourceNode) sourceNode.stop(whenAbs);
+	
+	// 3. Atualiza as variáveis JS no momento certo
+	const delayMs = (whenAbs - audioCtx.currentTime) * 1000;
+	setTimeout(() => {
+		// O "nextSource" vira o oficial
+		sourceNode = nextSourceNode;
+		nextSourceNode = null;
+		startTime = audioCtx.currentTime - offset;
+		currentSectionIndex = newIdx;
+		isScheduled = false; // Libera
+		updateButtonStyles();
+	}, delayMs);
+}
+
+// --- CONTROLES UI ---
 function scheduleSection(i) {
-	if (!isPlaying) { jumpToSection(i, true); return; }
+	if (!isPlaying) {
+		jumpToSection(i, true);
+		return;
+	}
 	if (i === currentSectionIndex) return;
-	nextSectionIndex = i; updateButtonStyles();
+	
+	// Apenas marca visualmente para a próxima troca
+	nextSectionIndex = i;
+	updateButtonStyles();
 	if (navigator.vibrate) navigator.vibrate(30);
 }
 
 function jumpToSection(i, auto) {
-	currentSectionIndex = i; nextSectionIndex = -1;
+	currentSectionIndex = i;
+	nextSectionIndex = -1;
 	pausedAt = sections[i].time;
 	updateButtonStyles();
-	if (auto) playAudio(pausedAt);
-	else {
-		const m = Math.floor(pausedAt / 60), s = Math.floor(pausedAt % 60);
-		document.getElementById('timer').innerText = `${m < 10 ? '0' + m : m}:${s < 10 ? '0' + s : s}`;
+	
+	if (auto) {
+		playAudio(pausedAt);
+	} else {
+		updateTimerVisual(pausedAt);
 	}
+}
+
+function updateTimerVisual(seconds) {
+	const m = Math.floor(seconds / 60);
+	const s = Math.floor(seconds % 60);
+	document.getElementById('timer').innerText = `${m < 10 ? '0' + m : m}:${s < 10 ? '0' + s : s}`;
 }
 
 function updateUI(playing) {
