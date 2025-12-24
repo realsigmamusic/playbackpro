@@ -83,7 +83,7 @@ Para que o player entenda onde começa o refrão ou o verso, você deve criar um
 {
   "title": "Nome da Música",
   "artist": "Nome do Artista",
-  "bpm": 70,
+  "bpm": 70.0,
   "key": "G",
   "sections": [
     {
